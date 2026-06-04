@@ -1,0 +1,70 @@
+Metadata-Version: 2.4
+Name: lerobot_teleoperator_nao_vuer
+Version: 0.1.0
+Summary: LeRobot XR teleoperator for one-arm NAO inverse kinematics with Vuer and Pyroki
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+# NAO Vuer XR Teleoperator
+
+This package provides an XR teleoperator for controlling one NAO arm with inverse kinematics from a WebXR headset, following the same general interaction model as the SO101 Vuer teleoperator.
+
+It uses Vuer for the XR session, Pyroki for inverse kinematics, and the NAO LeRobot robot plugin to execute joint commands on the physical robot.
+
+## Requirements
+
+- A working LeRobot environment
+- The dependencies from `requirements.txt`
+- A loadable NAO URDF and meshes
+- NAOqi Python bindings available in the runtime environment
+- TLS certificates for WebXR, for example `cert.pem` and `key.pem`
+
+## Installation
+
+```bash
+cd /root/lerobot/lerobot_teleoperator_nao_vuer
+pip install -r requirements.txt
+pip install -e .
+```
+
+You also need the official NAO model installed locally. A typical layout is:
+
+```text
+/root/lerobot/external/nao/
+  nao_meshes/
+  nao_robot/
+    nao_description/
+      urdf/
+        naoV50_generated_urdf/
+          nao.urdf
+```
+
+## Usage
+
+```bash
+lerobot-teleoperate \
+  --robot.type=nao_qi \
+  --robot.robot_ip=127.0.0.1 \
+  --robot.arm=right \
+  --robot.enable_camera=true \
+  --teleop.type=nao_vuer \
+  --teleop.arm=right \
+  --teleop.user_hand=right \
+  --teleop.urdf_path=/root/lerobot/external/nao/nao_robot/nao_description/urdf/naoV50_generated_urdf/nao.urdf \
+  --teleop.target_link_name=r_gripper \
+  --teleop.vuer_cert=/absolute/path/to/cert.pem \
+  --teleop.vuer_key=/absolute/path/to/key.pem
+```
+
+Then open the XR client from a headset browser using:
+
+```text
+https://<YOUR_IP>:8012/?ws=wss://<YOUR_IP>:8012
+```
+
+## Notes
+
+- The current implementation is intentionally one-arm only.
+- The default right-arm IK target link for the official NAO V5 URDF is `r_gripper`.
+- Hand opening is mapped to the configured `hand_joint_name`, which defaults to `RHand`.
+- If you switch to the left arm, you should also override `--teleop.target_link_name=l_gripper` and `--teleop.hand_joint_name=LHand`.

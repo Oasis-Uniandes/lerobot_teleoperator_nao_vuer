@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_nao_vuer"
+version = "0.1.0"
+description = "LeRobot XR teleoperator for one-arm NAO inverse kinematics with Vuer and Pyroki"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["lerobot_teleoperator_nao_vuer*"]

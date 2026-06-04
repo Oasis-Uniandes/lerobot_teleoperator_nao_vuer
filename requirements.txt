@@ -1,0 +1,6 @@
+vuer
+pyroki
+scipy
+opencv-python
+robot_descriptions
+yourdfpy
