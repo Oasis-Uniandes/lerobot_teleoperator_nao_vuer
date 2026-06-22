@@ -4,6 +4,8 @@ This package provides an XR teleoperator for controlling one NAO arm with invers
 
 It uses Vuer for the XR session, Pyroki for inverse kinematics, and the NAO LeRobot robot plugin to execute joint commands on the physical robot.
 
+An optional Viser visualization can also be enabled to inspect the IK target and the current robot configuration in a browser on localhost:8080.
+
 ## Requirements
 
 - A working LeRobot environment
@@ -45,6 +47,7 @@ lerobot-teleoperate \
   --teleop.user_hand=right \
   --teleop.urdf_path=/root/lerobot/external/nao/nao_robot/nao_description/urdf/naoV50_generated_urdf/nao.urdf \
   --teleop.target_link_name=r_gripper \
+  --teleop.enable_visualization=true \
   --teleop.vuer_cert=/absolute/path/to/cert.pem \
   --teleop.vuer_key=/absolute/path/to/key.pem
 ```
@@ -53,6 +56,12 @@ Then open the XR client from a headset browser using:
 
 ```text
 https://<YOUR_IP>:8012/?ws=wss://<YOUR_IP>:8012
+```
+
+If visualization is enabled, open this page on the host machine as well:
+
+```text
+http://localhost:8080
 ```
 
 ## Connecting From The Headset
@@ -79,9 +88,47 @@ https://<YOUR_IP>:8012/?ws=wss://<YOUR_IP>:8012
 - If the headset page opens but tracking does not update, first verify that the browser granted motion and XR permissions.
 - If you use the provided launcher script, export `ROBOT_IP`, `CERT_PATH`, and `KEY_PATH` before sourcing it.
 
+## Intuitive Mapping
+
+The teleoperator uses a direct, mirror-free spatial mapping anchored at your
+shoulder:
+
+- Reach **forward** and NAO's hand goes **forward**.
+- Raise your hand **up** and NAO's hand goes **up**.
+- Move your hand to **your right** and NAO's hand goes to **its right**.
+
+Position always follows your hand 1:1. The gripper also follows your wrist
+orientation while your hand is open, and freezes that orientation as you close
+into a grasp so the grip is not disturbed. Because the NAO arm only has 5 joints,
+orientation is best-effort (position is weighted more heavily in the IK).
+
+If position feels right but the gripper points in a slightly wrong direction,
+nudge it with `--teleop.wrist_offset_euler_deg="(roll,pitch,yaw)"` (degrees), or
+turn orientation tracking off entirely with `--teleop.track_orientation=false`.
+
+## Opening And Closing The Hand
+
+Just open and close your hand naturally — NAO's hand follows.
+
+- With **hand tracking**, the whole-hand open/close is read from your finger
+  joints. It self-calibrates: open and close your hand fully once at the start so
+  it learns your range.
+- With **motion controllers**, the trigger/squeeze controls the hand instead.
+
+Related flags:
+
+- `--teleop.hand_control_source=auto|fist|pinch` — `auto` (default) uses
+  whole-hand tracking and falls back to pinch/trigger; `fist` forces whole-hand
+  only; `pinch` forces the pinch/trigger.
+- `--teleop.invert_hand=true` — flip the direction if the robot hand closes when
+  you open yours.
+- `--teleop.hand_smoothing=0.5` — exponential smoothing in `[0, 1)`; higher is
+  smoother but laggier, `0.0` disables it.
+
 ## Notes
 
 - The current implementation is intentionally one-arm only.
 - The default right-arm IK target link for the official NAO V5 URDF is `r_gripper`.
 - Hand opening is mapped to the configured `hand_joint_name`, which defaults to `RHand`.
 - If you switch to the left arm, you should also override `--teleop.target_link_name=l_gripper` and `--teleop.hand_joint_name=LHand`.
+- Visualization is disabled by default and can be enabled with `--teleop.enable_visualization=true`.
