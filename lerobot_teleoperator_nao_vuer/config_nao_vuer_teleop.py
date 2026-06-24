@@ -2,15 +2,40 @@ from dataclasses import dataclass
 
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+# Arm-dependent defaults, keyed by side. These must match the joint names the
+# downstream NAO robot expects for the corresponding arm.
+ARM_TARGET_LINK_NAME = {"left": "l_gripper", "right": "r_gripper"}
+ARM_HAND_JOINT_NAME = {"left": "LHand", "right": "RHand"}
+# Per-side default position for the IK target (NAO frame, metres). The left arm
+# sits on +y, the right arm on -y.
+ARM_INITIAL_TARGET_POSITION = {
+    "left": (0.18, 0.15, 0.35),
+    "right": (0.18, -0.15, 0.35),
+}
+
+VALID_ARMS = ("left", "right", "both")
+
+
+def sides_for_arm(arm: str) -> tuple[str, ...]:
+    """Return the individual arm sides controlled for a given `arm` setting."""
+    arm = arm.lower()
+    if arm == "both":
+        return ("left", "right")
+    return (arm,)
+
 
 @TeleoperatorConfig.register_subclass("nao_vuer")
 @dataclass
 class NaoVuerTeleopConfig(TeleoperatorConfig):
+    # 'left', 'right' or 'both'.
     arm: str = "right"
     urdf_name: str = ""
     urdf_path: str = ""
-    target_link_name: str = "r_gripper"
-    hand_joint_name: str = "RHand"
+    # Arm-dependent fields. Leave as None to derive them from `arm`; set
+    # explicitly to override (single-arm only). For 'both' they are resolved
+    # per-side in the teleoperator.
+    target_link_name: str | None = None
+    hand_joint_name: str | None = None
 
     robot_ip: str = "127.0.0.1"
     robot_port: int = 9559
@@ -28,7 +53,16 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
     initial_target_position: tuple[float, float, float] = (0.18, -0.15, 0.35)
     initial_target_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
-    user_hand: str = "right"
+    # NAO is a small robot (~0.22 m arm reach) but VR hands move at human scale
+    # (~0.6 m reach). This factor shrinks the hand displacement measured from
+    # your shoulder down to NAO's workspace, so your full range of motion maps
+    # into the arm's reachable range instead of saturating at the joint limits.
+    target_position_scale: float = 0.4
+
+    # Which of the user's hands drives the arm. Leave as None to follow `arm`
+    # (left arm <- left hand, right arm <- right hand). Ignored for 'both',
+    # where each NAO arm is driven by the matching user hand.
+    user_hand: str | None = None
     target_coord_sys: str = "hip"
     user_height: float = 1.40
     shoulder_lateral_offset: float = 0.20
@@ -40,10 +74,21 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
     vuer_key: str = "./key.pem"
     enable_visualization: bool = False
     viser_port: int = 8080
-    enable_camera_feed: bool = False
-    camera_distance_to_user: float = 0.8
-    camera_height_offset: float = -0.15
+    # Draw orientation pointer gizmos in the VR scene: short axes for your hand
+    # and long axes for NAO's achieved gripper orientation, both just in front of
+    # your hand. The red (+X) axis points where your fingers point.
+    show_orientation_gizmos: bool = True
+    # How far in front of the hand (metres, along the pointing axis) to place the
+    # gizmos so they are not hidden inside the rendered hand mesh.
+    gizmo_forward_offset: float = 0.12
+    enable_camera_feed: bool = True
+    # NAO head-camera feed shown as a fixed screen in front of you in VR (same
+    # placement as the SO101 Vuer teleop). The screen sits at
+    # [lateral, user_height + height_offset, screen_z], distanceToCamera metres away.
+    camera_distance_to_user: float = 1.0
+    camera_height_offset: float = -0.6
     camera_lateral_offset: float = 0.0
+    camera_screen_z: float = -3.0
     pinch_deadzone: float = 0.2
 
     # --- Wrist / gripper orientation ---
@@ -80,3 +125,20 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
         "LElbowRoll",
         "LWristYaw",
     )
+
+    def __post_init__(self) -> None:
+        arm = self.arm.lower()
+        if arm not in VALID_ARMS:
+            raise ValueError(
+                f"Unsupported arm '{self.arm}'. Expected 'left', 'right' or 'both'."
+            )
+        # Resolve arm-dependent fields from `arm` unless explicitly overridden.
+        # For 'both', target_link_name / hand_joint_name / user_hand stay
+        # per-side (resolved in the teleoperator) and are left unset here.
+        if arm != "both":
+            if self.target_link_name is None:
+                self.target_link_name = ARM_TARGET_LINK_NAME[arm]
+            if self.hand_joint_name is None:
+                self.hand_joint_name = ARM_HAND_JOINT_NAME[arm]
+            if self.user_hand is None:
+                self.user_hand = arm

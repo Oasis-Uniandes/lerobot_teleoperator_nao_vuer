@@ -2,6 +2,7 @@ import asyncio
 import gc
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,52 @@ from viser.extras import ViserUrdf
 import yourdfpy
 from yourdfpy import URDF
 
-from .config_nao_vuer_teleop import NaoVuerTeleopConfig
+from .config_nao_vuer_teleop import (
+    ARM_HAND_JOINT_NAME,
+    ARM_INITIAL_TARGET_POSITION,
+    ARM_TARGET_LINK_NAME,
+    NaoVuerTeleopConfig,
+    sides_for_arm,
+)
 from .pyroki_snippets import solve_ik
+
+# Axis remap from VR (+X=right, +Y=up, -Z=forward) to NAO base
+# (+X=forward, +Y=left, +Z=up). Orthonormal, so its transpose maps back.
+R_VR_TO_ROBOT = np.array([
+    [0, 0, -1],
+    [-1, 0, 0],
+    [0, 1, 0],
+], dtype=float)
+
+
+@dataclass
+class _SideState:
+    """Per-arm configuration plus the live VR target it tracks.
+
+    The runtime fields (target_*, curl_*, viz_*) are mutated under the
+    teleoperator's lock.
+    """
+
+    side: str  # NAO arm: 'left' or 'right'
+    user_hand: str  # which of the user's hands drives this arm
+    arm_joint_names: tuple[str, ...]
+    target_link_name: str
+    hand_joint_name: str
+    joint_mask: np.ndarray
+    target_pos: np.ndarray
+    target_wxyz: np.ndarray
+    gizmo: Any = None  # viser transform controls handle (visualization only)
+    target_link_index: int = 0  # index into robot.links.names for FK
+    target_hand: float = 1.0  # start with an open hand
+    # Auto-calibration range for whole-hand fist tracking (per user hand).
+    curl_min: float | None = None
+    curl_max: float | None = None
+    # Your hand's pose in VR (for the "hand" orientation gizmo).
+    viz_pos: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    viz_rot: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # NAO's achieved gripper orientation mapped back into VR space (for the
+    # "nao" orientation gizmo, drawn at the same hand position).
+    nao_viz_rot: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
 class NaoVuerTeleop(Teleoperator):
@@ -40,26 +85,20 @@ class NaoVuerTeleop(Teleoperator):
         self._cam_thread = None
         self._lock = threading.Lock()
 
-        self._target_pos = np.array(config.initial_target_position, dtype=float)
-        self._target_wxyz = np.array(config.initial_target_wxyz, dtype=float)
-        self._target_hand = 1.0  # start with an open hand
-        # Auto-calibration range for whole-hand fist tracking.
-        self._curl_min = None
-        self._curl_max = None
-        self._viz_pos = np.array([0.0, 0.0, 0.0])
-        self._viz_rot = np.array([0.0, 0.0, 0.0])
+        self._sides: list[_SideState] = []
+        self._side_by_user_hand: dict[str, _SideState] = {}
         self._latest_q_sol = None
         self._latest_frame = None
         self._latest_action = {}
         self._prev_cfg = None
         self.viser_server = None
         self.urdf_vis = None
-        self.ik_web_target = None
 
     def configure(self) -> None:
-        if self.config.arm.lower() not in {"left", "right"}:
-            raise ValueError("arm must be 'left' or 'right'.")
-        if self.config.user_hand.lower() not in {"left", "right"}:
+        arm = self.config.arm.lower()
+        if arm not in {"left", "right", "both"}:
+            raise ValueError("arm must be 'left', 'right' or 'both'.")
+        if arm != "both" and (self.config.user_hand or "").lower() not in {"left", "right"}:
             raise ValueError("user_hand must be 'left' or 'right'.")
         if not self.config.urdf_path and not self.config.urdf_name:
             raise ValueError("nao_vuer requires urdf_path or urdf_name.")
@@ -108,34 +147,34 @@ class NaoVuerTeleop(Teleoperator):
             if joint.limit.velocity is None:
                 joint.limit.velocity = default_velocity
 
-    def _arm_joint_names(self) -> tuple[str, ...]:
-        if self.config.arm.lower() == "left":
+    def _arm_joint_names_for(self, side: str) -> tuple[str, ...]:
+        if side == "left":
             return self.config.left_arm_joint_names
         return self.config.right_arm_joint_names
 
-    def _make_joint_mask(self) -> np.ndarray:
-        selected = set(self._arm_joint_names())
-        if self.config.hand_joint_name:
-            selected.add(self.config.hand_joint_name)
+    def _make_joint_mask(self, arm_joint_names: tuple[str, ...], hand_joint_name: str) -> np.ndarray:
+        selected = set(arm_joint_names)
+        if hand_joint_name:
+            selected.add(hand_joint_name)
         return np.array([
             1.0 if joint_name in selected else 0.0
             for joint_name in self.robot.joints.actuated_names
         ])
 
-    def _solution_to_action(self, q_sol: np.ndarray, hand_value: float) -> dict[str, float]:
+    def _side_action(self, state: _SideState, q_sol: np.ndarray, hand_value: float) -> dict[str, float]:
         action = {}
-        for joint_name in self._arm_joint_names():
+        for joint_name in state.arm_joint_names:
             if joint_name in self.robot.joints.actuated_names:
                 idx = self.robot.joints.actuated_names.index(joint_name)
                 action[f"{joint_name}.pos"] = float(q_sol[idx])
-        if self.config.hand_joint_name in self.robot.joints.actuated_names:
-            idx = self.robot.joints.actuated_names.index(self.config.hand_joint_name)
+        if state.hand_joint_name and state.hand_joint_name in self.robot.joints.actuated_names:
+            idx = self.robot.joints.actuated_names.index(state.hand_joint_name)
             lower = float(self.robot.joints.lower_limits[idx])
             upper = float(self.robot.joints.upper_limits[idx])
-            action[f"{self.config.hand_joint_name}.pos"] = lower + hand_value * (upper - lower)
+            action[f"{state.hand_joint_name}.pos"] = lower + hand_value * (upper - lower)
         return action
 
-    def _torso_origin_vr(self) -> np.ndarray:
+    def _torso_origin_vr(self, user_hand: str) -> np.ndarray:
         """Reference point (the user's shoulder) in VR space.
 
         The hand is measured relative to this point, so reaching the same way
@@ -151,7 +190,7 @@ class NaoVuerTeleop(Teleoperator):
 
         right_vec = np.array([1.0, 0.0, 0.0])
         shoulder_offset = self.config.shoulder_lateral_offset
-        if self.config.user_hand == "left":
+        if user_hand == "left":
             origin_pos -= right_vec * shoulder_offset
         else:
             origin_pos += right_vec * shoulder_offset
@@ -166,38 +205,69 @@ class NaoVuerTeleop(Teleoperator):
             origin_pos[1] = self.config.user_height - self.config.shoulder_vertical_offset
         return origin_pos
 
-    def compute_robot_target_matrix(self, hand_matrix_vr: np.ndarray) -> np.ndarray:
-        T_torso_vr = np.eye(4)
-        T_torso_vr[:3, 3] = self._torso_origin_vr()
-        T_hand_torso = np.linalg.inv(T_torso_vr) @ hand_matrix_vr
-
-        # Pure axis remap from VR to the robot torso frame:
+    def compute_robot_target_matrix(
+        self, hand_matrix_vr: np.ndarray, user_hand: str, R_hand_vr: np.ndarray | None = None
+    ) -> np.ndarray:
+        # Position: hand displacement from your shoulder, scaled down to NAO's
+        # much smaller reach, then remapped from VR axes to the robot base.
         #   VR:    +X = right, +Y = up,   -Z = forward
         #   Robot: +X = forward, +Y = left, +Z = up
-        # This is what makes teleop intuitive: hand forward -> gripper forward,
-        # hand up -> gripper up, hand to your right -> gripper to NAO's right.
-        # (The previous code mixed an extra global yaw into this, which made
-        # "hand forward" come out as "gripper to the side".)
-        R_vr_to_robot = np.array([
-            [0, 0, -1],
-            [-1, 0, 0],
-            [0, 1, 0],
-        ])
-        T_vr_to_robot = np.eye(4)
-        T_vr_to_robot[:3, :3] = R_vr_to_robot
-        T_hand_robot = T_vr_to_robot @ T_hand_torso
+        rel_vr = (hand_matrix_vr[:3, 3] - self._torso_origin_vr(user_hand))
+        rel_vr = rel_vr * self.config.target_position_scale
+        pos_robot = R_VR_TO_ROBOT @ rel_vr
 
-        # Local alignment offset so the gripper link lines up with the natural
-        # grip of your hand. Position is unaffected by this (it is a rotation in
-        # the gripper's own frame); tune via config.wrist_offset_euler_deg.
-        offset = R.from_euler(
-            "xyz", np.deg2rad(self.config.wrist_offset_euler_deg)
-        ).as_matrix()
-        T_offset = np.eye(4)
-        T_offset[:3, :3] = offset
-        return T_hand_robot @ T_offset
+        # Orientation: use the supplied VR hand frame (built so its +X points
+        # where your fingers point), falling back to the raw wrist rotation.
+        if R_hand_vr is None:
+            R_hand_vr = hand_matrix_vr[:3, :3]
+        # Optional local fine-tune in the gripper frame (config.wrist_offset_euler_deg).
+        R_offset = R.from_euler("xyz", np.deg2rad(self.config.wrist_offset_euler_deg)).as_matrix()
+        R_robot = R_VR_TO_ROBOT @ R_hand_vr @ R_offset
 
-    def _hand_open_from_joints(self, hand_data) -> float | None:
+        T = np.eye(4)
+        T[:3, :3] = R_robot
+        T[:3, 3] = pos_robot
+        return T
+
+    def _hand_forward_vr(self, hand_data) -> np.ndarray | None:
+        """Direction the fingers point, in VR world space, from WebXR joints.
+
+        Uses wrist -> middle-finger knuckle (metacarpal), which stays stable even
+        when the fingers curl into a fist. Returns None without joint data (e.g.
+        motion controllers).
+        """
+        if hand_data is None or len(hand_data) < 25 * 16:
+            return None
+        joints = np.array(hand_data[: 25 * 16], dtype=float).reshape(25, 16)
+        # Column-major 4x4 matrices: translation is elements 12, 13, 14.
+        positions = joints[:, 12:15]
+        forward = positions[self._PALM_REF_JOINT] - positions[0]  # middle MCP - wrist
+        norm = np.linalg.norm(forward)
+        if norm < 1e-6:
+            return None
+        return forward / norm
+
+    @staticmethod
+    def _pointing_frame_vr(forward_vr: np.ndarray) -> np.ndarray | None:
+        """Right-handed VR frame whose +X axis is `forward_vr` (the pointing axis).
+
+        The remaining axes are anchored to world-up so the frame does not twist
+        as you roll your wrist — only the pointing direction matters, which keeps
+        the gripper's red (+X) axis on your fingers and avoids confusing roll.
+        """
+        norm = np.linalg.norm(forward_vr)
+        if norm < 1e-6:
+            return None
+        x = forward_vr / norm
+        up = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(x, up))) > 0.95:  # pointing near-vertical: pick a new ref
+            up = np.array([0.0, 0.0, -1.0])
+        y = np.cross(up, x)
+        y /= np.linalg.norm(y)
+        z = np.cross(x, y)
+        return np.column_stack([x, y, z])
+
+    def _hand_open_from_joints(self, state: _SideState, hand_data) -> float | None:
         """Estimate how open the hand is (0 = fist, 1 = open) from WebXR finger joints.
 
         Returns None when full finger-joint data is not available (e.g. when
@@ -218,51 +288,65 @@ class NaoVuerTeleop(Teleoperator):
         tip_dist = np.linalg.norm(positions[list(self._FINGERTIP_JOINTS)] - wrist, axis=1)
         curl = float(np.clip(tip_dist.mean() / palm_scale, 0.0, 5.0))
 
-        if self._curl_min is None:
-            self._curl_min = self._curl_max = curl
-        self._curl_min = min(self._curl_min, curl)
-        self._curl_max = max(self._curl_max, curl)
-        span = self._curl_max - self._curl_min
+        if state.curl_min is None:
+            state.curl_min = state.curl_max = curl
+        state.curl_min = min(state.curl_min, curl)
+        state.curl_max = max(state.curl_max, curl)
+        span = state.curl_max - state.curl_min
         if span < 1e-3:
             return None  # need to see at least one open/close to calibrate
-        return float(np.clip((curl - self._curl_min) / span, 0.0, 1.0))
+        return float(np.clip((curl - state.curl_min) / span, 0.0, 1.0))
 
-    def _compute_hand_open(self, grip_close: float, hand_data) -> float:
+    def _compute_hand_open(self, state: _SideState, grip_close: float, hand_data) -> float:
         """Resolve the target hand-open value in [0, 1] from the configured source."""
         open_frac = None
         if self.config.hand_control_source in ("auto", "fist"):
-            open_frac = self._hand_open_from_joints(hand_data)
+            open_frac = self._hand_open_from_joints(state, hand_data)
         if open_frac is None and self.config.hand_control_source != "fist":
             # Fall back to pinch (hand tracking) / trigger (controllers):
             # closing the pinch/trigger closes the hand.
             open_frac = 1.0 - grip_close
         if open_frac is None:
-            open_frac = self._target_hand  # keep last command if fist not yet calibrated
+            open_frac = state.target_hand  # keep last command if fist not yet calibrated
         if self.config.invert_hand:
             open_frac = 1.0 - open_frac
         return float(np.clip(open_frac, 0.0, 1.0))
 
-    def _update_target_from_vr(self, hand_matrix_vr: np.ndarray, grip_close: float, hand_data=None) -> None:
-        viz_pos = hand_matrix_vr[:3, 3]
-        viz_euler = R.from_matrix(hand_matrix_vr[:3, :3]).as_euler("xyz")
-        T_robot = self.compute_robot_target_matrix(hand_matrix_vr)
+    def _update_target_from_vr(
+        self, state: _SideState, hand_matrix_vr: np.ndarray, grip_close: float, hand_data=None
+    ) -> None:
+        # Build a hand frame whose +X points where the fingers point, so NAO's
+        # gripper +X (the red axis you see in viser) follows your fingers. Use
+        # finger-joint geometry when available, else the device's forward ray.
+        forward_vr = self._hand_forward_vr(hand_data)
+        if forward_vr is None:
+            forward_vr = -hand_matrix_vr[:3, 2]  # device -Z is "forward"
+        R_hand_vr = self._pointing_frame_vr(forward_vr)
+        if R_hand_vr is None:
+            R_hand_vr = hand_matrix_vr[:3, :3]
+
+        # Show the orientation gizmo a little out in front of the hand (along the
+        # pointing axis) so it is not buried inside the rendered hand mesh.
+        viz_pos = hand_matrix_vr[:3, 3] + R_hand_vr[:, 0] * self.config.gizmo_forward_offset
+        viz_euler = R.from_matrix(R_hand_vr).as_euler("xyz")
+        T_robot = self.compute_robot_target_matrix(hand_matrix_vr, state.user_hand, R_hand_vr)
         pos = T_robot[:3, 3]
         quat_xyzw = R.from_matrix(T_robot[:3, :3]).as_quat()
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
-        hand_open = self._compute_hand_open(grip_close, hand_data)
+        hand_open = self._compute_hand_open(state, grip_close, hand_data)
         grip_amount = 1.0 - hand_open  # 0 = fully open, 1 = fully closed
         alpha = float(np.clip(self.config.hand_smoothing, 0.0, 0.99))
 
         with self._lock:
-            self._target_pos = pos
-            self._viz_pos = viz_pos
-            self._viz_rot = viz_euler
+            state.target_pos = pos
+            state.viz_pos = viz_pos
+            state.viz_rot = viz_euler
             # Track wrist orientation while the hand is open; freeze it as you
             # close into a grasp so the grip does not get disturbed.
             if self.config.track_orientation and grip_amount < self.config.pinch_deadzone:
-                self._target_wxyz = quat_wxyz
-            self._target_hand = alpha * self._target_hand + (1.0 - alpha) * hand_open
+                state.target_wxyz = quat_wxyz
+            state.target_hand = alpha * state.target_hand + (1.0 - alpha) * hand_open
 
     def _vuer_worker(self):
         loop = asyncio.new_event_loop()
@@ -276,24 +360,27 @@ class NaoVuerTeleop(Teleoperator):
 
         @app.add_handler("HAND_MOVE")
         async def on_hand_move(event, session):
-            hand_data = event.value.get(self.config.user_hand)
-            if not hand_data or len(hand_data) < 16:
-                return
-            hand_matrix_vr = np.array(hand_data[:16]).reshape(4, 4).T
-            hand_state = event.value.get(f"{self.config.user_hand}State", {})
-            pinch_val = hand_state.get("pinch", hand_state.get("pinchStrength", 0.0))
-            self._update_target_from_vr(hand_matrix_vr, float(pinch_val), hand_data=hand_data)
+            # Update every controlled arm from the matching user hand.
+            for user_hand, state in self._side_by_user_hand.items():
+                hand_data = event.value.get(user_hand)
+                if not hand_data or len(hand_data) < 16:
+                    continue
+                hand_matrix_vr = np.array(hand_data[:16]).reshape(4, 4).T
+                hand_state = event.value.get(f"{user_hand}State", {})
+                pinch_val = hand_state.get("pinch", hand_state.get("pinchStrength", 0.0))
+                self._update_target_from_vr(state, hand_matrix_vr, float(pinch_val), hand_data=hand_data)
 
         @app.add_handler("CONTROLLER_MOVE")
         async def on_controller_move(event, session):
-            controller_data = event.value.get(self.config.user_hand)
-            if not controller_data or len(controller_data) < 16:
-                return
-            hand_matrix_vr = np.array(controller_data[:16]).reshape(4, 4).T
-            state = event.value.get(f"{self.config.user_hand}State", {})
-            trigger_val = state.get("triggerValue", state.get("squeezeValue", 0.0))
-            # Controllers have no finger joints, so fall back to the trigger.
-            self._update_target_from_vr(hand_matrix_vr, float(trigger_val), hand_data=None)
+            for user_hand, state in self._side_by_user_hand.items():
+                controller_data = event.value.get(user_hand)
+                if not controller_data or len(controller_data) < 16:
+                    continue
+                hand_matrix_vr = np.array(controller_data[:16]).reshape(4, 4).T
+                ctrl_state = event.value.get(f"{user_hand}State", {})
+                trigger_val = ctrl_state.get("triggerValue", ctrl_state.get("squeezeValue", 0.0))
+                # Controllers have no finger joints, so fall back to the trigger.
+                self._update_target_from_vr(state, hand_matrix_vr, float(trigger_val), hand_data=None)
 
         @app.spawn(start=True)
         async def main(session: VuerSession):
@@ -303,20 +390,41 @@ class NaoVuerTeleop(Teleoperator):
             while self._is_connected:
                 with self._lock:
                     current_img = None if self._latest_frame is None else self._latest_frame.copy()
-                    viz_pos = self._viz_pos.copy()
-                    viz_rot = self._viz_rot.copy()
+                    viz = [
+                        (s.side, s.viz_pos.copy(), s.viz_rot.copy(), s.nao_viz_rot.copy())
+                        for s in self._sides
+                    ]
 
-                session.upsert(
-                    CoordsMarker(
-                        position=viz_pos.tolist(),
-                        rotation=viz_rot.tolist(),
-                        scale=0.15,
-                        key="ik_gizmo",
-                    ),
-                    to="bgChildren",
-                )
+                if self.config.show_orientation_gizmos:
+                    for side, viz_pos, viz_rot, nao_viz_rot in viz:
+                        # Short axes: the orientation of your hand.
+                        session.upsert(
+                            CoordsMarker(
+                                position=viz_pos.tolist(),
+                                rotation=viz_rot.tolist(),
+                                scale=0.12,
+                                headScale=1.0,
+                                key=f"hand_gizmo_{side}",
+                            ),
+                            to="bgChildren",
+                        )
+                        # Long axes (same origin): NAO's actual gripper orientation.
+                        # Line them up with the short axes for the most natural grip;
+                        # tune --teleop.wrist_offset_euler_deg if they stay twisted.
+                        session.upsert(
+                            CoordsMarker(
+                                position=viz_pos.tolist(),
+                                rotation=nao_viz_rot.tolist(),
+                                scale=0.22,
+                                headScale=2.0,
+                                key=f"nao_gizmo_{side}",
+                            ),
+                            to="bgChildren",
+                        )
 
                 if current_img is not None:
+                    # Fixed screen anchored in front of the headset (HUD), matching
+                    # the SO101 Vuer placement so it is visible in immersive VR.
                     session.upsert(
                         ImageBackground(
                             current_img,
@@ -327,8 +435,8 @@ class NaoVuerTeleop(Teleoperator):
                             key="camera_feed",
                             position=[
                                 self.config.camera_lateral_offset,
-                                self.config.camera_height_offset,
-                                -self.config.camera_distance_to_user,
+                                self.config.user_height + self.config.camera_height_offset,
+                                self.config.camera_screen_z,
                             ],
                         ),
                         to="bgChildren",
@@ -339,33 +447,56 @@ class NaoVuerTeleop(Teleoperator):
 
     def _ik_worker(self):
         while self._is_connected:
-            with self._lock:
-                target_pos = self._target_pos.copy()
-                target_quat = self._target_wxyz.copy()
-                hand_value = self._target_hand
+            cfg = np.array(self._prev_cfg, copy=True)
+            action = {}
+            for state in self._sides:
+                with self._lock:
+                    target_pos = state.target_pos.copy()
+                    target_quat = state.target_wxyz.copy()
+                    hand_value = state.target_hand
 
-            q_sol = solve_ik(
-                robot=self.robot,
-                target_link_name=self.config.target_link_name,
-                target_position=target_pos,
-                target_wxyz=target_quat,
-                joint_mask=self.joint_mask,
-                prev_cfg=self._prev_cfg,
-            )
+                q_sol = solve_ik(
+                    robot=self.robot,
+                    target_link_name=state.target_link_name,
+                    target_position=target_pos,
+                    target_wxyz=target_quat,
+                    joint_mask=state.joint_mask,
+                    prev_cfg=cfg,
+                )
 
-            for idx, mask_value in enumerate(self.joint_mask):
-                if mask_value == 0.0:
-                    q_sol[idx] = self._prev_cfg[idx]
+                # Keep joints outside this arm at their previous values so each
+                # arm only moves its own joints.
+                for idx, mask_value in enumerate(state.joint_mask):
+                    if mask_value == 0.0:
+                        q_sol[idx] = cfg[idx]
+                cfg = np.array(q_sol, copy=True)
 
-            self._prev_cfg = np.array(q_sol, copy=True)
+                action.update(self._side_action(state, cfg, hand_value))
+                if state.gizmo is not None:
+                    state.gizmo.position = target_pos
+                    state.gizmo.wxyz = target_quat
+
+            self._prev_cfg = cfg
             if self.urdf_vis is not None:
                 self.urdf_vis.update_cfg(self._prev_cfg)
-            if self.ik_web_target is not None:
-                self.ik_web_target.position = target_pos
-                self.ik_web_target.wxyz = target_quat
+
+            # NAO's actually-achieved gripper orientation per arm, mapped back
+            # into VR space so it can be drawn next to your hand for comparison.
+            nao_rots = {}
+            if self.config.show_orientation_gizmos:
+                link_poses = np.array(self.robot.forward_kinematics(cfg))
+                for state in self._sides:
+                    w, x, y, z = link_poses[state.target_link_index, :4]
+                    R_robot = R.from_quat([x, y, z, w]).as_matrix()
+                    R_vr = R_VR_TO_ROBOT.T @ R_robot
+                    nao_rots[state.side] = R.from_matrix(R_vr).as_euler("xyz")
+
             with self._lock:
-                self._latest_q_sol = np.array(q_sol, copy=True)
-                self._latest_action = self._solution_to_action(self._latest_q_sol, hand_value)
+                self._latest_q_sol = np.array(cfg, copy=True)
+                self._latest_action = action
+                for state in self._sides:
+                    if state.side in nao_rots:
+                        state.nao_viz_rot = nao_rots[state.side]
 
             time.sleep(0.01)
 
@@ -382,7 +513,14 @@ class NaoVuerTeleop(Teleoperator):
                             break
                 if active_robot is not None and hasattr(active_robot, "get_observation"):
                     obs = active_robot.get_observation()
+                    # Prefer the NAO head camera, but fall back to any image-shaped
+                    # observation so the feed works regardless of the exact key.
                     image = obs.get("nao_head_rgb")
+                    if not (isinstance(image, np.ndarray) and image.ndim == 3):
+                        image = next(
+                            (v for v in obs.values() if isinstance(v, np.ndarray) and v.ndim == 3),
+                            None,
+                        )
                     if isinstance(image, np.ndarray) and image.ndim == 3:
                         if image.dtype != np.uint8:
                             image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
@@ -393,11 +531,68 @@ class NaoVuerTeleop(Teleoperator):
                 pass
             time.sleep(0.033)
 
+    def _build_sides(self) -> None:
+        """Create one _SideState (target + mask + optional gizmo) per controlled arm."""
+        self._sides = []
+        self._side_by_user_hand = {}
+        single_arm = self.config.arm.lower() != "both"
+        initial_wxyz = np.array(self.config.initial_target_wxyz, dtype=float)
+
+        for side in sides_for_arm(self.config.arm):
+            if single_arm:
+                user_hand = self.config.user_hand
+                target_link_name = self.config.target_link_name
+                hand_joint_name = self.config.hand_joint_name
+                initial_position = self.config.initial_target_position
+            else:
+                # left arm <- left hand, right arm <- right hand.
+                user_hand = side
+                target_link_name = ARM_TARGET_LINK_NAME[side]
+                hand_joint_name = ARM_HAND_JOINT_NAME[side]
+                initial_position = ARM_INITIAL_TARGET_POSITION[side]
+
+            arm_joint_names = self._arm_joint_names_for(side)
+            joint_mask = self._make_joint_mask(arm_joint_names, hand_joint_name)
+
+            gizmo = None
+            if self.config.enable_visualization and self.viser_server is not None:
+                gizmo = self.viser_server.scene.add_transform_controls(
+                    f"/ik_target_{side}",
+                    scale=0.1,
+                    position=initial_position,
+                    wxyz=self.config.initial_target_wxyz,
+                )
+
+            state = _SideState(
+                side=side,
+                user_hand=user_hand,
+                arm_joint_names=arm_joint_names,
+                target_link_name=target_link_name,
+                hand_joint_name=hand_joint_name,
+                joint_mask=joint_mask,
+                target_pos=np.array(initial_position, dtype=float),
+                target_wxyz=initial_wxyz.copy(),
+                gizmo=gizmo,
+                target_link_index=self.robot.links.names.index(target_link_name),
+                viz_pos=np.array(initial_position, dtype=float),
+            )
+            self._sides.append(state)
+            self._side_by_user_hand[user_hand] = state
+
+            # Warm up the JAX solver for this arm so the worker loop is responsive.
+            solve_ik(
+                robot=self.robot,
+                target_link_name=target_link_name,
+                target_position=np.array(initial_position, dtype=float),
+                target_wxyz=initial_wxyz,
+                joint_mask=joint_mask,
+                prev_cfg=self._prev_cfg,
+            )
+
     def connect(self) -> None:
         self.configure()
         self.urdf = self._load_urdf()
         self.robot = pk.Robot.from_urdf(self.urdf)
-        self.joint_mask = self._make_joint_mask()
         self._prev_cfg = np.array(self.robot.joint_var_cls(0).default_factory(), copy=True)
 
         if self.config.enable_visualization:
@@ -405,21 +600,8 @@ class NaoVuerTeleop(Teleoperator):
             self.viser_server.scene.add_grid("/ground", width=2, height=2)
             self.urdf_vis = ViserUrdf(self.viser_server, self.urdf, root_node_name="/nao")
             self.urdf_vis.update_cfg(self._prev_cfg)
-            self.ik_web_target = self.viser_server.scene.add_transform_controls(
-                "/ik_target",
-                scale=0.1,
-                position=self.config.initial_target_position,
-                wxyz=self.config.initial_target_wxyz,
-            )
 
-        solve_ik(
-            robot=self.robot,
-            target_link_name=self.config.target_link_name,
-            target_position=np.array(self.config.initial_target_position, dtype=float),
-            target_wxyz=np.array(self.config.initial_target_wxyz, dtype=float),
-            joint_mask=self.joint_mask,
-            prev_cfg=self._prev_cfg,
-        )
+        self._build_sides()
 
         self._is_connected = True
         self._ik_thread = threading.Thread(target=self._ik_worker, daemon=True)
@@ -444,9 +626,16 @@ class NaoVuerTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
-        features = {f"{joint}.pos": float for joint in self._arm_joint_names()}
-        if self.config.hand_joint_name:
-            features[f"{self.config.hand_joint_name}.pos"] = float
+        features = {}
+        for side in sides_for_arm(self.config.arm):
+            for joint in self._arm_joint_names_for(side):
+                features[f"{joint}.pos"] = float
+            if self.config.arm.lower() == "both":
+                hand_joint_name = ARM_HAND_JOINT_NAME[side]
+            else:
+                hand_joint_name = self.config.hand_joint_name
+            if hand_joint_name:
+                features[f"{hand_joint_name}.pos"] = float
         return features
 
     @property
