@@ -57,7 +57,7 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
     # (~0.6 m reach). This factor shrinks the hand displacement measured from
     # your shoulder down to NAO's workspace, so your full range of motion maps
     # into the arm's reachable range instead of saturating at the joint limits.
-    target_position_scale: float = 0.4
+    target_position_scale: float = 0.2
 
     # Which of the user's hands drives the arm. Leave as None to follow `arm`
     # (left arm <- left hand, right arm <- right hand). Ignored for 'both',

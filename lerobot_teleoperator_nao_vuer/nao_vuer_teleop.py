@@ -55,6 +55,10 @@ class _SideState:
     target_wxyz: np.ndarray
     gizmo: Any = None  # viser transform controls handle (visualization only)
     target_link_index: int = 0  # index into robot.links.names for FK
+    # Gripper rest position (robot frame) at the default config. Hand motion is
+    # added on top of this, so zero hand displacement keeps the IK target on the
+    # robot instead of jumping to the base origin.
+    rest_pos: np.ndarray = field(default_factory=lambda: np.zeros(3))
     target_hand: float = 1.0  # start with an open hand
     # Auto-calibration range for whole-hand fist tracking (per user hand).
     curl_min: float | None = None
@@ -206,7 +210,11 @@ class NaoVuerTeleop(Teleoperator):
         return origin_pos
 
     def compute_robot_target_matrix(
-        self, hand_matrix_vr: np.ndarray, user_hand: str, R_hand_vr: np.ndarray | None = None
+        self,
+        hand_matrix_vr: np.ndarray,
+        user_hand: str,
+        R_hand_vr: np.ndarray | None = None,
+        position_anchor: np.ndarray | None = None,
     ) -> np.ndarray:
         # Position: hand displacement from your shoulder, scaled down to NAO's
         # much smaller reach, then remapped from VR axes to the robot base.
@@ -215,6 +223,10 @@ class NaoVuerTeleop(Teleoperator):
         rel_vr = (hand_matrix_vr[:3, 3] - self._torso_origin_vr(user_hand))
         rel_vr = rel_vr * self.config.target_position_scale
         pos_robot = R_VR_TO_ROBOT @ rel_vr
+        # Anchor the displacement on the gripper's actual rest position so the
+        # target starts on the robot (no constant offset) instead of at the base.
+        if position_anchor is not None:
+            pos_robot = pos_robot + position_anchor
 
         # Orientation: use the supplied VR hand frame (built so its +X points
         # where your fingers point), falling back to the raw wrist rotation.
@@ -247,22 +259,29 @@ class NaoVuerTeleop(Teleoperator):
             return None
         return forward / norm
 
-    @staticmethod
-    def _pointing_frame_vr(forward_vr: np.ndarray) -> np.ndarray | None:
-        """Right-handed VR frame whose +X axis is `forward_vr` (the pointing axis).
+    def _hand_frame_vr(self, hand_data, hand_matrix_vr: np.ndarray) -> np.ndarray:
+        """Right-handed VR frame whose +X axis points where the fingers point.
 
-        The remaining axes are anchored to world-up so the frame does not twist
-        as you roll your wrist — only the pointing direction matters, which keeps
-        the gripper's red (+X) axis on your fingers and avoids confusing roll.
+        +X is the accurate finger-pointing direction (from joint geometry when
+        available). The remaining axes are anchored to the hand's *own* up vector
+        (the wrist matrix +Y), so rolling your wrist rolls the gripper too. A
+        world-up anchor would instead discard roll; using the hand's own up keeps
+        full orientation (roll and pitch) while still putting red (+X) on your
+        fingers.
         """
-        norm = np.linalg.norm(forward_vr)
+        forward = self._hand_forward_vr(hand_data)
+        if forward is None:
+            forward = -hand_matrix_vr[:3, 2]  # device -Z is "forward"
+        norm = np.linalg.norm(forward)
         if norm < 1e-6:
-            return None
-        x = forward_vr / norm
-        up = np.array([0.0, 1.0, 0.0])
-        if abs(float(np.dot(x, up))) > 0.95:  # pointing near-vertical: pick a new ref
-            up = np.array([0.0, 0.0, -1.0])
-        y = np.cross(up, x)
+            return hand_matrix_vr[:3, :3]
+        x = forward / norm
+        # Roll reference: the hand's own up axis (rolls with the wrist).
+        up_ref = hand_matrix_vr[:3, 1]
+        y = up_ref - np.dot(up_ref, x) * x
+        if np.linalg.norm(y) < 1e-6:  # up_ref parallel to x: fall back to world-up
+            up_ref = np.array([0.0, 1.0, 0.0])
+            y = up_ref - np.dot(up_ref, x) * x
         y /= np.linalg.norm(y)
         z = np.cross(x, y)
         return np.column_stack([x, y, z])
@@ -315,21 +334,18 @@ class NaoVuerTeleop(Teleoperator):
     def _update_target_from_vr(
         self, state: _SideState, hand_matrix_vr: np.ndarray, grip_close: float, hand_data=None
     ) -> None:
-        # Build a hand frame whose +X points where the fingers point, so NAO's
-        # gripper +X (the red axis you see in viser) follows your fingers. Use
-        # finger-joint geometry when available, else the device's forward ray.
-        forward_vr = self._hand_forward_vr(hand_data)
-        if forward_vr is None:
-            forward_vr = -hand_matrix_vr[:3, 2]  # device -Z is "forward"
-        R_hand_vr = self._pointing_frame_vr(forward_vr)
-        if R_hand_vr is None:
-            R_hand_vr = hand_matrix_vr[:3, :3]
+        # Build a hand frame whose +X points where the fingers point (so NAO's
+        # gripper +X, the red axis in viser, follows your fingers) while keeping
+        # the wrist roll, so rolling your hand rolls the gripper.
+        R_hand_vr = self._hand_frame_vr(hand_data, hand_matrix_vr)
 
         # Show the orientation gizmo a little out in front of the hand (along the
         # pointing axis) so it is not buried inside the rendered hand mesh.
         viz_pos = hand_matrix_vr[:3, 3] + R_hand_vr[:, 0] * self.config.gizmo_forward_offset
         viz_euler = R.from_matrix(R_hand_vr).as_euler("xyz")
-        T_robot = self.compute_robot_target_matrix(hand_matrix_vr, state.user_hand, R_hand_vr)
+        T_robot = self.compute_robot_target_matrix(
+            hand_matrix_vr, state.user_hand, R_hand_vr, position_anchor=state.rest_pos
+        )
         pos = T_robot[:3, 3]
         quat_xyzw = R.from_matrix(T_robot[:3, :3]).as_quat()
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
@@ -537,6 +553,9 @@ class NaoVuerTeleop(Teleoperator):
         self._side_by_user_hand = {}
         single_arm = self.config.arm.lower() != "both"
         initial_wxyz = np.array(self.config.initial_target_wxyz, dtype=float)
+        # Gripper rest poses at the default config, so each target can be anchored
+        # on the robot instead of jumping to the base origin at startup.
+        rest_link_poses = np.array(self.robot.forward_kinematics(self._prev_cfg))
 
         for side in sides_for_arm(self.config.arm):
             if single_arm:
@@ -553,13 +572,15 @@ class NaoVuerTeleop(Teleoperator):
 
             arm_joint_names = self._arm_joint_names_for(side)
             joint_mask = self._make_joint_mask(arm_joint_names, hand_joint_name)
+            target_link_index = self.robot.links.names.index(target_link_name)
+            rest_pos = np.array(rest_link_poses[target_link_index, 4:7], dtype=float)
 
             gizmo = None
             if self.config.enable_visualization and self.viser_server is not None:
                 gizmo = self.viser_server.scene.add_transform_controls(
                     f"/ik_target_{side}",
                     scale=0.1,
-                    position=initial_position,
+                    position=rest_pos,
                     wxyz=self.config.initial_target_wxyz,
                 )
 
@@ -570,10 +591,11 @@ class NaoVuerTeleop(Teleoperator):
                 target_link_name=target_link_name,
                 hand_joint_name=hand_joint_name,
                 joint_mask=joint_mask,
-                target_pos=np.array(initial_position, dtype=float),
+                target_pos=rest_pos.copy(),
                 target_wxyz=initial_wxyz.copy(),
                 gizmo=gizmo,
-                target_link_index=self.robot.links.names.index(target_link_name),
+                target_link_index=target_link_index,
+                rest_pos=rest_pos,
                 viz_pos=np.array(initial_position, dtype=float),
             )
             self._sides.append(state)

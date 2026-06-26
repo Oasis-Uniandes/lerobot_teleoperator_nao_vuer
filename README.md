@@ -144,13 +144,18 @@ workspace:
 - `--teleop.target_position_scale=0.4` — fraction of your real reach mapped onto
   NAO. Without scaling the targets would constantly saturate at the joint limits.
 
-Orientation follows **where your fingers point**: NAO's gripper `+X` axis (the
-red arrow you see in viser) is aimed along your fingers. Point forward and the
-gripper points forward; point up and it points up. The frame is anchored to
-world-up, so simply rolling your wrist does not twist the gripper — only the
-pointing direction matters. This is computed from your finger-joint geometry
-(wrist → middle knuckle), so it is robust even when you curl into a fist; with
-motion controllers it falls back to the controller's forward ray.
+The IK target is anchored on the gripper's actual rest position, so when your
+hand is at your shoulder the target sits **on** the robot — there is no constant
+offset at startup. Any gap you see while teleoperating is the genuine,
+unreachable part of the workspace (NAO's arm is short and has only 5 joints).
+
+Orientation follows your full hand pose. NAO's gripper `+X` axis (the red arrow
+you see in viser) is aimed along your fingers — point forward and the gripper
+points forward; point up and it points up — while **rolling your wrist rolls the
+gripper**. The pointing direction comes from your finger-joint geometry (wrist →
+middle knuckle), so it is robust even when you curl into a fist, and the roll is
+taken from the hand's own up axis; with motion controllers it falls back to the
+controller's pose.
 
 The gripper holds that orientation while your hand is open and freezes it as you
 close into a grasp so the grip is not disturbed. Because the NAO arm only has 5
