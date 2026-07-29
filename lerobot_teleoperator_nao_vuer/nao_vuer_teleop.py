@@ -14,7 +14,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from scipy.spatial.transform import Rotation as R
 from vuer import Vuer, VuerSession
-from vuer.schemas import CoordsMarker, DefaultScene, ImageBackground
+from vuer.schemas import CoordsMarker, DefaultScene, Hands, ImageBackground, MotionControllers
 from viser.extras import ViserUrdf
 import yourdfpy
 from yourdfpy import URDF
@@ -393,6 +393,13 @@ class NaoVuerTeleop(Teleoperator):
                 if not controller_data or len(controller_data) < 16:
                     continue
                 hand_matrix_vr = np.array(controller_data[:16]).reshape(4, 4).T
+
+                # Apply controller offset to align with wrist pose
+                T_offset = np.eye(4)
+                T_offset[:3, :3] = R.from_euler("x", self.config.controller_pitch_offset_deg, degrees=True).as_matrix()
+                T_offset[2, 3] = self.config.controller_z_offset_m
+                hand_matrix_vr = hand_matrix_vr @ T_offset
+
                 ctrl_state = event.value.get(f"{user_hand}State", {})
                 trigger_val = ctrl_state.get("triggerValue", ctrl_state.get("squeezeValue", 0.0))
                 # Controllers have no finger joints, so fall back to the trigger.
@@ -401,6 +408,8 @@ class NaoVuerTeleop(Teleoperator):
         @app.spawn(start=True)
         async def main(session: VuerSession):
             session.set @ DefaultScene()
+            session.upsert(Hands(stream=True, key="hands", showLeft=True, showRight=True), to="bgChildren")
+            session.upsert(MotionControllers(stream=True, key="motionControllers", left=True, right=True), to="bgChildren")
             while self._is_connected:
                 with self._lock:
                     current_img = None if self._latest_frame is None else self._latest_frame.copy()

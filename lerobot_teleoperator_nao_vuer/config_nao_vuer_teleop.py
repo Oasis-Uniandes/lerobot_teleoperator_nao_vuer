@@ -77,7 +77,7 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
     # Draw orientation pointer gizmos in the VR scene: short axes for your hand
     # and long axes for NAO's achieved gripper orientation, both just in front of
     # your hand. The red (+X) axis points where your fingers point.
-    show_orientation_gizmos: bool = True
+    show_orientation_gizmos: bool = False
     # How far in front of the hand (metres, along the pointing axis) to place the
     # gizmos so they are not hidden inside the rendered hand mesh.
     gizmo_forward_offset: float = 0.12
@@ -98,7 +98,13 @@ class NaoVuerTeleopConfig(TeleoperatorConfig):
     # Local alignment offset (degrees, applied in the gripper frame) so the NAO
     # gripper lines up with the natural grip of your hand. Tune this if the
     # gripper points in a slightly wrong direction while position feels correct.
-    wrist_offset_euler_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    wrist_offset_euler_deg: tuple[float, float, float] = (-90.0, 0.0, 0.0)
+
+    # Offset applied to VR controllers to align them with the wrist pose.
+    # A typical Quest 3 controller's pointer (-Z) is pitched down by ~40 degrees
+    # relative to the wrist, and its origin is ~10cm in front of the wrist.
+    controller_pitch_offset_deg: float = 40.0
+    controller_z_offset_m: float = 0.10
 
     # --- Hand open / close ---
     # "auto"  : use whole-hand fist tracking when available, else pinch/trigger.
