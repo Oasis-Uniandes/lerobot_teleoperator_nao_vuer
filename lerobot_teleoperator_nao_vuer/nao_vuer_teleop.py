@@ -14,7 +14,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from scipy.spatial.transform import Rotation as R
 from vuer import Vuer, VuerSession
-from vuer.schemas import CoordsMarker, Hands, ImageBackground, MotionControllers, Scene
+from vuer.schemas import CoordsMarker, DefaultScene, ImageBackground
 from viser.extras import ViserUrdf
 import yourdfpy
 from yourdfpy import URDF
@@ -400,9 +400,7 @@ class NaoVuerTeleop(Teleoperator):
 
         @app.spawn(start=True)
         async def main(session: VuerSession):
-            session.set(Scene())
-            session.upsert(Hands(stream=True, key="hands", showLeft=True, showRight=True), to="bgChildren")
-            session.upsert(MotionControllers(stream=True, key="motionControllers", left=True, right=True), to="bgChildren")
+            session.set @ DefaultScene()
             while self._is_connected:
                 with self._lock:
                     current_img = None if self._latest_frame is None else self._latest_frame.copy()
